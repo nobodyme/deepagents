@@ -2078,13 +2078,15 @@ def parse_args() -> argparse.Namespace:
         default="none",
         metavar="TYPE",
         help=(
-            "Remote sandbox for code execution (default: none - local only). "
-            "Built-ins: agentcore, daytona, langsmith, modal, runloop, vercel. "
+            "Sandbox for code execution (default: none - local only). "
+            "Built-ins: agentcore, daytona, docker, langsmith, modal, "
+            "runloop, vercel. "
             "Third-party and config-declared providers are also accepted. "
             "Pass --sandbox with no value to use [sandboxes].default from "
             "config (keep the bare form last on the command line so a "
-            "following subcommand isn't read as its value). langsmith is "
-            "bundled; others require installing an extra or package."
+            "following subcommand isn't read as its value). langsmith and "
+            "docker are bundled; others require installing an extra or "
+            "package. docker runs containers on your local Docker daemon."
         ),
     )
 
@@ -2356,7 +2358,8 @@ async def run_textual_cli_async(
         auto_approve: Compatibility input for callers using the previous Boolean
             API. `True` maps to unrestricted `yolo`.
         sandbox_type: Type of sandbox
-            ("none", "agentcore", "modal", "runloop", "daytona", "langsmith")
+            ("none", "agentcore", "docker", "modal", "runloop", "daytona",
+            "langsmith")
         sandbox_id: Optional existing sandbox ID to reuse.
         sandbox_snapshot_name: Snapshot (langsmith) or blueprint (runloop) name.
         sandbox_setup: Optional path to setup script to run in the sandbox

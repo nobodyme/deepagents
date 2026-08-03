@@ -332,6 +332,39 @@ class TestLangSmithIntegration(BaseSandboxIntegrationTest):
             yield sandbox
 
 
+def _docker_daemon_available() -> bool:
+    """Whether a local Docker daemon is reachable."""
+    import shutil
+    import subprocess
+
+    docker_cli = shutil.which("docker")
+    if docker_cli is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [docker_cli, "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(
+    not _docker_daemon_available(), reason="Docker daemon not available"
+)
+class TestDockerIntegration(BaseSandboxIntegrationTest):
+    """Test local Docker backend integration."""
+
+    @pytest.fixture(scope="class")
+    def sandbox(self) -> Iterator[SandboxBackendProtocol]:
+        """Provide a local Docker sandbox instance."""
+        with create_sandbox("docker") as sandbox:
+            yield sandbox
+
+
 _has_aws_credentials = bool(
     os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_PROFILE")
 )
