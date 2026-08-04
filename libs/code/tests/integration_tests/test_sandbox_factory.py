@@ -1,7 +1,8 @@
 """Test sandbox integrations with upload/download functionality.
 
-This module tests sandbox backends (RunLoop, Daytona, Modal, LangSmith) with
-support for optional sandbox reuse to reduce test execution time.
+This module tests sandbox backends (RunLoop, Daytona, Modal, LangSmith,
+AgentCore, Docker) with support for optional sandbox reuse to reduce test
+execution time.
 
 Set `REUSE_SANDBOX=1` environment variable to reuse sandboxes across tests
 within a class. Otherwise, a fresh sandbox is created for each test method.

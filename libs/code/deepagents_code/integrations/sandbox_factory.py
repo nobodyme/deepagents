@@ -149,11 +149,13 @@ def create_sandbox(
         f"{backend.id}[/green]"
     )
 
-    # Run setup script if provided
-    if setup_script_path:
-        _run_sandbox_setup(backend, setup_script_path)
-
     try:
+        # Run setup script if provided. Inside the try block so a failing
+        # setup script still triggers cleanup below instead of leaking the
+        # just-created sandbox (for the local docker provider a leaked
+        # container would keep running on the user's machine indefinitely).
+        if setup_script_path:
+            _run_sandbox_setup(backend, setup_script_path)
         yield backend
     finally:
         if should_cleanup:
@@ -519,14 +521,26 @@ class _DockerProvider(SandboxProvider):
 
         Returns:
             The completed process (never raises on non-zero exit).
+
+        Raises:
+            RuntimeError: If the CLI call times out (e.g. a hung daemon),
+                so callers surface a sandbox error instead of a raw
+                `subprocess.TimeoutExpired`.
         """
-        return subprocess.run(  # noqa: S603  # fixed argv built from validated provider inputs
-            [self._docker_cli, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            return subprocess.run(  # noqa: S603  # fixed argv, no shell; values are passed as single arguments
+                [self._docker_cli, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            msg = (
+                f"Docker CLI command 'docker {args[0]}' timed out "
+                f"after {timeout} seconds"
+            )
+            raise RuntimeError(msg) from e
 
     def _container_state(self, container_id: str) -> str | None:
         """Return the container's state string, or `None` if it does not exist.
@@ -534,13 +548,25 @@ class _DockerProvider(SandboxProvider):
         Returns:
             The Docker state (`'running'`, `'exited'`, ...), or `None` when
                 the container is not found.
+
+        Raises:
+            RuntimeError: If `docker inspect` fails for a reason other than
+                the container not existing (e.g. daemon hiccup) — mapping
+                those to "not found" would tell users to discard a valid
+                sandbox ID.
         """
         result = self._run_cli(
             ["inspect", "--format", "{{.State.Status}}", container_id],
             timeout=_DOCKER_CLI_TIMEOUT,
         )
         if result.returncode != 0:
-            return None
+            stderr = result.stderr.lower()
+            if "no such object" in stderr or "no such container" in stderr:
+                return None
+            msg = (
+                f"Failed to inspect container '{container_id}': {result.stderr.strip()}"
+            )
+            raise RuntimeError(msg)
         return result.stdout.strip()
 
     def get_or_create(
@@ -588,7 +614,18 @@ class _DockerProvider(SandboxProvider):
             state = self._container_state(sandbox_id)
             if state is None:
                 raise SandboxNotFoundError(sandbox_id)
-            if state != "running":
+            if state == "paused":
+                # `docker start` refuses paused containers.
+                unpause = self._run_cli(
+                    ["unpause", sandbox_id], timeout=_DOCKER_CLI_TIMEOUT
+                )
+                if unpause.returncode != 0:
+                    msg = (
+                        f"Failed to unpause existing container '{sandbox_id}': "
+                        f"{unpause.stderr.strip()}"
+                    )
+                    raise RuntimeError(msg)
+            elif state != "running":
                 start = self._run_cli(
                     ["start", sandbox_id], timeout=_DOCKER_CLI_TIMEOUT
                 )
@@ -632,7 +669,9 @@ class _DockerProvider(SandboxProvider):
                 ],
                 timeout=_DOCKER_CREATE_TIMEOUT,
             )
-        except subprocess.TimeoutExpired as e:
+        except RuntimeError as e:
+            # `_run_cli` raises RuntimeError only on CLI timeout here; the
+            # likely cause is a slow first-time image pull.
             msg = (
                 f"Timed out creating Docker sandbox from image "
                 f"'{effective_image}' (the image pull may be slow; pre-pull it "
@@ -655,6 +694,18 @@ class _DockerProvider(SandboxProvider):
                     break
             except Exception:  # noqa: S110, BLE001  # Sandbox not ready yet, continue polling
                 pass
+            # Bail out early if the container already died (e.g. a custom
+            # image whose /bin/sh rejects the keep-alive loop) instead of
+            # burning the whole timeout — mirrors _ModalProvider's poll().
+            try:
+                state = self._container_state(container_id)
+            except RuntimeError:
+                state = "unknown"  # Transient inspect failure; keep polling
+            if state in {None, "exited", "dead"}:
+                with contextlib.suppress(Exception):
+                    self.delete(sandbox_id=container_id)
+                msg = "Docker sandbox terminated unexpectedly during startup"
+                raise RuntimeError(msg)
             time.sleep(2)
         else:
             with contextlib.suppress(Exception):

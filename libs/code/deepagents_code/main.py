@@ -2358,8 +2358,8 @@ async def run_textual_cli_async(
         auto_approve: Compatibility input for callers using the previous Boolean
             API. `True` maps to unrestricted `yolo`.
         sandbox_type: Type of sandbox
-            ("none", "agentcore", "docker", "modal", "runloop", "daytona",
-            "langsmith")
+            ("none", "agentcore", "daytona", "docker", "langsmith", "modal",
+            "runloop", "vercel")
         sandbox_id: Optional existing sandbox ID to reuse.
         sandbox_snapshot_name: Snapshot (langsmith) or blueprint (runloop) name.
         sandbox_setup: Optional path to setup script to run in the sandbox

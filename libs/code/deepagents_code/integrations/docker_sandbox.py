@@ -57,6 +57,31 @@ misreported as timed out.
 _EXIT_NOT_FOUND: Final = 64
 _EXIT_IS_DIRECTORY: Final = 65
 _EXIT_PERMISSION_DENIED: Final = 66
+_EXIT_NOT_A_REGULAR_FILE: Final = 67
+
+_DOCKER_CLI_ERROR_MARKERS: Final = (
+    "error response from daemon",
+    "cannot connect to the docker daemon",
+    "error during connect",
+)
+"""Lowercase stderr markers identifying a `docker` client/daemon failure.
+
+Used to tell a *transport* failure (container stopped or removed, daemon
+unreachable) apart from an ordinary non-zero exit of the command running
+inside the container. Transport failures must raise rather than return an
+`ExecuteResponse`: `BaseSandbox`'s `ls`/`glob` parsers ignore exit codes and
+would otherwise read the docker error text as a successful empty listing.
+"""
+
+
+class DockerCliError(RuntimeError):
+    """The `docker` CLI itself failed — the sandbox is unreachable.
+
+    Raised when `docker exec` cannot reach the container at all (container
+    stopped or removed, daemon down), as opposed to the executed command
+    failing inside a healthy container. Mirrors how remote backends surface
+    SDK transport exceptions instead of fabricating a command result.
+    """
 
 
 class DockerSandbox(BaseSandbox):
@@ -124,8 +149,12 @@ class DockerSandbox(BaseSandbox):
     ) -> ExecuteResponse:
         """Execute a shell command inside the container via `docker exec`.
 
-        Stdout and stderr are merged into a single stream (in order) so
-        `BaseSandbox`'s `2>&1`-based helper scripts parse correctly.
+        The command's stderr is appended to stdout in the returned output
+        (wrapped in a `<stderr>` block, matching `DaytonaSandbox`).
+        `BaseSandbox`'s helper scripts redirect with `2>&1` inside the
+        container, so their JSON output is unaffected. Keeping the client-side
+        streams separate is what lets a `docker` transport failure be
+        distinguished from the command itself failing.
 
         Args:
             command: Shell command string, run with `/bin/sh -c`.
@@ -134,12 +163,12 @@ class DockerSandbox(BaseSandbox):
                 killed; the command inside the container may keep running.
 
         Returns:
-            `ExecuteResponse` with combined output, exit code, and truncation
-                flag. `docker` CLI failures (e.g. container stopped) surface as
-                a non-zero exit code with the CLI's error message as output.
+            `ExecuteResponse` with output, exit code, and truncation flag.
 
         Raises:
             ValueError: If `timeout` is not positive.
+            DockerCliError: If the container is unreachable (stopped, removed,
+                or the daemon is down) rather than the command failing.
         """
         if not command or not isinstance(command, str):
             return ExecuteResponse(
@@ -163,8 +192,7 @@ class DockerSandbox(BaseSandbox):
                     "-c",
                     command,
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                capture_output=True,
                 stdin=subprocess.DEVNULL,
                 timeout=effective_timeout + _DOCKER_CLI_TIMEOUT_MARGIN,
                 check=False,
@@ -180,17 +208,30 @@ class DockerSandbox(BaseSandbox):
                 exit_code=124,  # Standard timeout exit code
             )
         except OSError as e:
-            return ExecuteResponse(
-                output=f"Error executing docker command ({type(e).__name__}): {e}",
-                exit_code=1,
-            )
+            msg = f"Failed to invoke the docker CLI: {e}"
+            raise DockerCliError(msg) from e
 
-        output = proc.stdout.decode("utf-8", errors="replace")
+        if proc.returncode != 0 and not proc.stdout:
+            stderr_text = proc.stderr.decode("utf-8", errors="replace").strip()
+            lowered = stderr_text.lower()
+            if any(marker in lowered for marker in _DOCKER_CLI_ERROR_MARKERS):
+                msg = (
+                    f"Docker sandbox container '{self._container_id}' is "
+                    f"unreachable: {stderr_text}"
+                )
+                raise DockerCliError(msg)
+
+        raw = proc.stdout
+        if proc.stderr:
+            stderr_body = proc.stderr.strip()
+            raw += b"\n<stderr>" + stderr_body + b"</stderr>"
         truncated = False
-        if len(output) > self._max_output_bytes:
-            output = output[: self._max_output_bytes]
-            output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
+        if len(raw) > self._max_output_bytes:
+            raw = raw[: self._max_output_bytes]
             truncated = True
+        output = raw.decode("utf-8", errors="replace")
+        if truncated:
+            output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
 
         return ExecuteResponse(
             output=output,
@@ -250,9 +291,10 @@ class DockerSandbox(BaseSandbox):
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Download files from the container by streaming `cat` output.
 
-        A probe script classifies missing paths, directories, and unreadable
-        files via distinct exit codes so failures map to the standardized
-        `FileOperationError` literals.
+        A probe script classifies missing paths, directories, non-regular
+        files (FIFOs, device nodes — which `cat` would block on or stream
+        unboundedly), and unreadable files via distinct exit codes so failures
+        map to the standardized `FileOperationError` literals.
 
         Args:
             paths: Absolute paths to download.
@@ -270,6 +312,7 @@ class DockerSandbox(BaseSandbox):
                 f"p={quoted}; "
                 f'if [ -d "$p" ]; then exit {_EXIT_IS_DIRECTORY}; '
                 f'elif [ ! -e "$p" ]; then exit {_EXIT_NOT_FOUND}; '
+                f'elif [ ! -f "$p" ]; then exit {_EXIT_NOT_A_REGULAR_FILE}; '
                 f'elif [ ! -r "$p" ]; then exit {_EXIT_PERMISSION_DENIED}; '
                 f'else exec cat "$p"; fi'
             )
@@ -298,6 +341,10 @@ class DockerSandbox(BaseSandbox):
                 responses.append(FileDownloadResponse(path=path, error=FILE_NOT_FOUND))
             elif proc.returncode == _EXIT_IS_DIRECTORY:
                 responses.append(FileDownloadResponse(path=path, error=IS_DIRECTORY))
+            elif proc.returncode == _EXIT_NOT_A_REGULAR_FILE:
+                responses.append(
+                    FileDownloadResponse(path=path, error="not a regular file")
+                )
             elif proc.returncode == _EXIT_PERMISSION_DENIED:
                 responses.append(
                     FileDownloadResponse(path=path, error=PERMISSION_DENIED)
@@ -332,4 +379,9 @@ def _map_write_error(stderr: str) -> str:
     return stderr or "upload failed"
 
 
-__all__ = ["DEFAULT_EXECUTE_TIMEOUT", "MAX_OUTPUT_BYTES", "DockerSandbox"]
+__all__ = [
+    "DEFAULT_EXECUTE_TIMEOUT",
+    "MAX_OUTPUT_BYTES",
+    "DockerCliError",
+    "DockerSandbox",
+]

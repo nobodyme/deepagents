@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 from deepagents.backends.protocol import ExecuteResponse
 
-from deepagents_code.integrations.docker_sandbox import DockerSandbox
+from deepagents_code.integrations.docker_sandbox import DockerCliError, DockerSandbox
 from deepagents_code.integrations.sandbox_config import SandboxConfig
 from deepagents_code.integrations.sandbox_factory import (
     _DOCKER_DEFAULT_IMAGE,
@@ -57,16 +57,65 @@ class TestDockerSandboxExecute:
         assert result.exit_code == 0
         assert result.truncated is False
 
-    def test_execute_nonzero_exit_code_preserved(self) -> None:
-        """`docker exec` failures surface as non-zero exit codes with output."""
+    def test_execute_command_failure_preserves_exit_code_and_stderr(self) -> None:
+        """A command failing inside a healthy container returns a normal response."""
         backend = DockerSandbox("cid123")
         with patch(f"{_BACKEND}.subprocess.run") as run:
             run.return_value = _completed(
-                [], returncode=126, stdout=b"container not running"
+                [], returncode=127, stdout=b"", stderr=b"sh: nope: not found"
             )
-            result = backend.execute("echo hi")
-        assert result.exit_code == 126
-        assert "container not running" in result.output
+            result = backend.execute("nope")
+        assert result.exit_code == 127
+        assert "<stderr>sh: nope: not found</stderr>" in result.output
+
+    def test_execute_appends_stderr_after_stdout(self) -> None:
+        """Command stderr is appended in a `<stderr>` block (Daytona-style)."""
+        backend = DockerSandbox("cid123")
+        with patch(f"{_BACKEND}.subprocess.run") as run:
+            run.return_value = _completed(
+                [], returncode=0, stdout=b"out\n", stderr=b"warning\n"
+            )
+            result = backend.execute("cmd")
+        assert result.output == "out\n\n<stderr>warning</stderr>"
+
+    def test_execute_daemon_error_raises_docker_cli_error(self) -> None:
+        """A docker transport failure raises instead of faking a command result.
+
+        `BaseSandbox.ls`/`glob` ignore exit codes, so returning the daemon
+        error as output would read as a successful empty listing.
+        """
+        backend = DockerSandbox("cid123")
+        with patch(f"{_BACKEND}.subprocess.run") as run:
+            run.return_value = _completed(
+                [],
+                returncode=1,
+                stdout=b"",
+                stderr=b"Error response from daemon: container cid123 is not running",
+            )
+            with pytest.raises(DockerCliError, match="unreachable"):
+                backend.execute("echo hi")
+
+    def test_execute_daemon_down_raises_docker_cli_error(self) -> None:
+        """An unreachable daemon raises `DockerCliError`."""
+        backend = DockerSandbox("cid123")
+        with patch(f"{_BACKEND}.subprocess.run") as run:
+            run.return_value = _completed(
+                [],
+                returncode=1,
+                stdout=b"",
+                stderr=b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            )
+            with pytest.raises(DockerCliError, match="unreachable"):
+                backend.execute("echo hi")
+
+    def test_execute_oserror_raises_docker_cli_error(self) -> None:
+        """A missing docker binary raises `DockerCliError`, not a fake response."""
+        backend = DockerSandbox("cid123")
+        with (
+            patch(f"{_BACKEND}.subprocess.run", side_effect=OSError("gone")),
+            pytest.raises(DockerCliError, match="Failed to invoke"),
+        ):
+            backend.execute("echo hi")
 
     def test_execute_timeout_returns_124(self) -> None:
         """A timed-out command returns the standard timeout exit code."""
@@ -173,6 +222,7 @@ class TestDockerSandboxDownload:
             (64, "file_not_found"),
             (65, "is_directory"),
             (66, "permission_denied"),
+            (67, "not a regular file"),
         ],
     )
     def test_download_maps_probe_exit_codes(
@@ -193,6 +243,19 @@ class TestDockerSandboxDownload:
             responses = backend.download_files(["relative.txt"])
         run.assert_not_called()
         assert responses[0].error == "invalid_path"
+
+    def test_ls_propagates_transport_failure(self) -> None:
+        """`ls()` on a dead container raises instead of returning an empty listing."""
+        backend = DockerSandbox("cid123")
+        with patch(f"{_BACKEND}.subprocess.run") as run:
+            run.return_value = _completed(
+                [],
+                returncode=1,
+                stdout=b"",
+                stderr=b"Error response from daemon: container cid123 is not running",
+            )
+            with pytest.raises(DockerCliError):
+                backend.ls("/workspace")
 
     def test_download_unknown_failure_surfaces_stderr(self) -> None:
         """Unclassified failures return the docker CLI's stderr text."""
@@ -354,6 +417,74 @@ class TestDockerProviderGetOrCreate:
         assert subcommands == ["inspect", "start", "exec"]
         # The exec call prepares the working directory.
         assert calls[-1][2:] == ["cid789", "mkdir", "-p", "/workspace"]
+
+    def test_attach_unpauses_paused_container(self) -> None:
+        """A paused container is unpaused (`docker start` refuses paused)."""
+        provider = _provider_with_daemon()
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess:
+            calls.append(argv)
+            if argv[1] == "inspect":
+                return _completed(argv, returncode=0, stdout="paused\n")
+            return _completed(argv, returncode=0, stdout="")
+
+        with patch(f"{_FACTORY}.subprocess.run", side_effect=fake_run):
+            backend = provider.get_or_create(sandbox_id="cid789")
+
+        assert backend.id == "cid789"
+        assert [argv[1] for argv in calls] == ["inspect", "unpause", "exec"]
+
+    def test_attach_inspect_failure_is_not_reported_as_not_found(self) -> None:
+        """A daemon hiccup during inspect raises rather than 'sandbox not found'."""
+        provider = _provider_with_daemon()
+        with patch(f"{_FACTORY}.subprocess.run") as run:
+            run.return_value = _completed(
+                [], returncode=1, stderr="error during connect: daemon busy"
+            )
+            with pytest.raises(RuntimeError, match="Failed to inspect"):
+                provider.get_or_create(sandbox_id="cid789")
+
+    def test_create_cli_timeout_suggests_prepull(self) -> None:
+        """A `docker run` timeout (slow pull) raises with a pre-pull hint."""
+        provider = _provider_with_daemon()
+        with (
+            patch(
+                f"{_FACTORY}.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=1800),
+            ),
+            pytest.raises(RuntimeError, match="pre-pull"),
+        ):
+            provider.get_or_create()
+
+    def test_create_bails_out_when_container_exits_during_startup(self) -> None:
+        """A container that dies right after `docker run` fails fast, not at timeout."""
+        provider = _provider_with_daemon()
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess:
+            calls.append(argv)
+            if argv[1] == "run":
+                return _completed(argv, returncode=0, stdout="cid456\n")
+            if argv[1] == "inspect":
+                return _completed(argv, returncode=0, stdout="exited\n")
+            return _completed(argv, returncode=0, stdout="")
+
+        with (
+            patch(f"{_FACTORY}.subprocess.run", side_effect=fake_run),
+            patch(f"{_FACTORY}.time.sleep"),
+            patch.object(
+                DockerSandbox,
+                "execute",
+                return_value=ExecuteResponse(output="", exit_code=1),
+            ),
+            pytest.raises(RuntimeError, match="terminated unexpectedly"),
+        ):
+            provider.get_or_create(timeout=180)
+
+        # Cleanup ran, and the poll bailed on the first iteration.
+        assert calls[-1][1] == "rm"
+        assert [argv[1] for argv in calls].count("inspect") == 1
 
     def test_attach_running_container_skips_start(self) -> None:
         """A running container is attached without `docker start`."""
