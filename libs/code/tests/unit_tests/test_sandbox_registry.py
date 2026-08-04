@@ -103,6 +103,7 @@ def test_builtins_are_available() -> None:
     assert registry.available_providers() == [
         "agentcore",
         "daytona",
+        "docker",
         "langsmith",
         "modal",
         "runloop",

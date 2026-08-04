@@ -49,6 +49,12 @@ BUILTIN_METADATA: dict[str, SandboxProviderMetadata] = {
         install=SandboxInstallHint(kind="extra", name="daytona"),
         backend_module="langchain_daytona",
     ),
+    "docker": SandboxProviderMetadata(
+        name="docker",
+        working_dir="/workspace",
+        # Uses the local `docker` CLI via subprocess; no extra package needed.
+        supports_sandbox_id=True,
+    ),
     "langsmith": SandboxProviderMetadata(
         name="langsmith",
         working_dir="/root",  # `$HOME` in the LangSmith sandbox
@@ -342,6 +348,7 @@ def _create_builtin_provider(name: str) -> SandboxProvider:
     builders = {
         "agentcore": sandbox_factory._AgentCoreProvider,
         "daytona": sandbox_factory._DaytonaProvider,
+        "docker": sandbox_factory._DockerProvider,
         "langsmith": sandbox_factory._LangSmithProvider,
         "modal": sandbox_factory._ModalProvider,
         "runloop": sandbox_factory._RunloopProvider,

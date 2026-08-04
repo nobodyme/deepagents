@@ -1,7 +1,8 @@
 """Test sandbox integrations with upload/download functionality.
 
-This module tests sandbox backends (RunLoop, Daytona, Modal, LangSmith) with
-support for optional sandbox reuse to reduce test execution time.
+This module tests sandbox backends (RunLoop, Daytona, Modal, LangSmith,
+AgentCore, Docker) with support for optional sandbox reuse to reduce test
+execution time.
 
 Set `REUSE_SANDBOX=1` environment variable to reuse sandboxes across tests
 within a class. Otherwise, a fresh sandbox is created for each test method.
@@ -329,6 +330,39 @@ class TestLangSmithIntegration(BaseSandboxIntegrationTest):
     def sandbox(self) -> Iterator[SandboxBackendProtocol]:
         """Provide a LangSmith sandbox instance."""
         with create_sandbox("langsmith") as sandbox:
+            yield sandbox
+
+
+def _docker_daemon_available() -> bool:
+    """Whether a local Docker daemon is reachable."""
+    import shutil
+    import subprocess
+
+    docker_cli = shutil.which("docker")
+    if docker_cli is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [docker_cli, "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(
+    not _docker_daemon_available(), reason="Docker daemon not available"
+)
+class TestDockerIntegration(BaseSandboxIntegrationTest):
+    """Test local Docker backend integration."""
+
+    @pytest.fixture(scope="class")
+    def sandbox(self) -> Iterator[SandboxBackendProtocol]:
+        """Provide a local Docker sandbox instance."""
+        with create_sandbox("docker") as sandbox:
             yield sandbox
 
 

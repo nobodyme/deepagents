@@ -36,7 +36,7 @@ The fastest way to start using Deep Agents. `deepagents-code` is a pre-built cod
 - **Interactive TUI** — rich terminal interface with streaming responses
 - **Conversation resume** — pick up where you left off across sessions
 - **Web search** — ground responses in live information
-- **Remote sandboxes** — run code in isolated environments (LangSmith, AgentCore, Daytona, Modal, Runloop, & more)
+- **Sandboxes** — run code in isolated environments, remote (LangSmith, AgentCore, Daytona, Modal, Runloop, & more) or local (Docker)
 - **Persistent memory** — agent remembers context across conversations
 - **Custom skills** — extend the agent with your own slash commands
 - **Headless mode** — run non-interactively for scripting and CI
@@ -46,7 +46,7 @@ The fastest way to start using Deep Agents. `deepagents-code` is a pre-built cod
 
 By default, `dcode` trusts the directory you run it in. Human-in-the-loop approval gates model-requested tool calls, but project artifacts are read before any approval prompt.
 
-Do not run `dcode` in a directory you do not trust without a sandbox backend. For untrusted repositories, use a [remote sandbox](https://docs.langchain.com/oss/python/deepagents/code/remote-sandboxes) so execution is isolated from your machine. Running `dcode` in a directory lets that directory's files shape execution. See [`THREAT_MODEL.md`](https://github.com/langchain-ai/deepagents/blob/main/libs/code/THREAT_MODEL.md) for details.
+Do not run `dcode` in a directory you do not trust without a sandbox backend. For untrusted repositories, use a [remote sandbox](https://docs.langchain.com/oss/python/deepagents/code/remote-sandboxes) so execution is isolated from your machine. The local `docker` provider isolates execution in a container on your machine (shared host kernel) and is not a substitute for a remote sandbox with untrusted repositories. Running `dcode` in a directory lets that directory's files shape execution. See [`THREAT_MODEL.md`](https://github.com/langchain-ai/deepagents/blob/main/libs/code/THREAT_MODEL.md) for details.
 
 ## 📖 Resources
 

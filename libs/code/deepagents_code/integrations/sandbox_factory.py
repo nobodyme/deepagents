@@ -8,7 +8,9 @@ import importlib.util
 import logging
 import os
 import shlex
+import shutil
 import string
+import subprocess  # noqa: S404  # fixed-argv `docker` CLI calls for the local Docker provider
 import time
 from contextlib import contextmanager
 from datetime import timedelta
@@ -89,7 +91,8 @@ def create_sandbox(
 
     Args:
         provider: Sandbox provider name. Built-ins (`'agentcore'`, `'daytona'`,
-            `'langsmith'`, `'modal'`, `'runloop'`, `'vercel'`), entry-point
+            `'docker'`, `'langsmith'`, `'modal'`, `'runloop'`, `'vercel'`),
+            entry-point
             providers, and config-declared providers are all resolved through
             the registry.
         sandbox_id: Optional existing sandbox ID to reuse
@@ -146,11 +149,13 @@ def create_sandbox(
         f"{backend.id}[/green]"
     )
 
-    # Run setup script if provided
-    if setup_script_path:
-        _run_sandbox_setup(backend, setup_script_path)
-
     try:
+        # Run setup script if provided. Inside the try block so a failing
+        # setup script still triggers cleanup below instead of leaking the
+        # just-created sandbox (for the local docker provider a leaked
+        # container would keep running on the user's machine indefinitely).
+        if setup_script_path:
+            _run_sandbox_setup(backend, setup_script_path)
         yield backend
     finally:
         if should_cleanup:
@@ -442,6 +447,288 @@ class _LangSmithProvider(SandboxProvider):
             msg = f"Failed to build snapshot '{snapshot_name}': {create_err}"
             raise RuntimeError(msg) from create_err
         return snapshot.id
+
+
+_DOCKER_DEFAULT_IMAGE = "python:3"
+"""Default image for local Docker sandboxes.
+
+Matches the LangSmith snapshot default. `BaseSandbox`'s file-operation helpers
+require `python3` and a POSIX shell inside the image, so bring-your-own images
+must provide both.
+"""
+
+_DOCKER_DEFAULT_WORKING_DIR = "/workspace"
+"""Default working directory inside local Docker sandbox containers."""
+
+_DOCKER_CONTAINER_LABEL = "com.deepagents.code.sandbox=true"
+"""Label applied to containers this provider creates, for identification."""
+
+_DOCKER_CLI_TIMEOUT = 30
+"""Timeout in seconds for fast `docker` CLI calls (version/inspect/start/rm)."""
+
+_DOCKER_CREATE_TIMEOUT = 1800
+"""Timeout in seconds for `docker run`, which may pull the image first."""
+
+_DOCKER_KEEPALIVE_COMMAND = "while :; do sleep 3600; done"
+"""Portable keep-alive loop (POSIX sh; works on busybox, unlike `sleep infinity`)."""
+
+
+class _DockerProvider(SandboxProvider):
+    """Local Docker sandbox provider.
+
+    Runs sandbox containers on the local Docker daemon via the `docker` CLI —
+    no cloud account, API key, or extra package required. Intended for local
+    development and testing; container isolation is bounded by the local
+    daemon (shared host kernel), which is weaker than a remote microVM
+    sandbox.
+    """
+
+    def __init__(self) -> None:
+        """Locate the `docker` CLI and verify the daemon is reachable.
+
+        Raises:
+            ValueError: If the `docker` CLI is not installed or the daemon
+                is not reachable.
+        """
+        docker_cli = shutil.which("docker")
+        if docker_cli is None:
+            msg = (
+                "Docker CLI not found on PATH. Install Docker "
+                "(https://docs.docker.com/get-docker/) to use the 'docker' "
+                "sandbox provider."
+            )
+            raise ValueError(msg)
+        self._docker_cli = docker_cli
+        probe = self._run_cli(
+            ["version", "--format", "{{.Server.Version}}"],
+            timeout=_DOCKER_CLI_TIMEOUT,
+        )
+        if probe.returncode != 0:
+            detail = probe.stderr.strip() or probe.stdout.strip()
+            msg = (
+                "Docker daemon is not reachable. Start Docker and retry. "
+                f"Details: {detail}"
+            )
+            raise ValueError(msg)
+
+    def _run_cli(
+        self,
+        args: list[str],
+        *,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a `docker` CLI command with captured text output.
+
+        Returns:
+            The completed process (never raises on non-zero exit).
+
+        Raises:
+            RuntimeError: If the CLI call times out (e.g. a hung daemon),
+                so callers surface a sandbox error instead of a raw
+                `subprocess.TimeoutExpired`.
+        """
+        try:
+            return subprocess.run(  # noqa: S603  # fixed argv, no shell; values are passed as single arguments
+                [self._docker_cli, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            msg = (
+                f"Docker CLI command 'docker {args[0]}' timed out "
+                f"after {timeout} seconds"
+            )
+            raise RuntimeError(msg) from e
+
+    def _container_state(self, container_id: str) -> str | None:
+        """Return the container's state string, or `None` if it does not exist.
+
+        Returns:
+            The Docker state (`'running'`, `'exited'`, ...), or `None` when
+                the container is not found.
+
+        Raises:
+            RuntimeError: If `docker inspect` fails for a reason other than
+                the container not existing (e.g. daemon hiccup) — mapping
+                those to "not found" would tell users to discard a valid
+                sandbox ID.
+        """
+        result = self._run_cli(
+            ["inspect", "--format", "{{.State.Status}}", container_id],
+            timeout=_DOCKER_CLI_TIMEOUT,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.lower()
+            if "no such object" in stderr or "no such container" in stderr:
+                return None
+            msg = (
+                f"Failed to inspect container '{container_id}': {result.stderr.strip()}"
+            )
+            raise RuntimeError(msg)
+        return result.stdout.strip()
+
+    def get_or_create(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        timeout: int = 180,
+        image: str | None = None,
+        working_dir: str | None = None,
+        **kwargs: Any,
+    ) -> SandboxBackendProtocol:
+        """Attach to an existing container or create a new sandbox container.
+
+        Args:
+            sandbox_id: Existing container ID or name to attach to. Stopped
+                containers are started. `None` creates a fresh container.
+            timeout: Seconds to wait for the container to become ready
+                (excludes image pull time, which is bounded separately).
+            image: Docker image for new containers. Defaults to
+                `DOCKER_SANDBOX_IMAGE` (or the `DEEPAGENTS_CODE_`-prefixed
+                variant), then `python:3`. The image must provide `python3`
+                and a POSIX shell.
+            working_dir: Working directory inside the container. Defaults to
+                `/workspace`; created if missing.
+            **kwargs: Rejected; passing any other keyword raises `TypeError`.
+
+        Returns:
+            `DockerSandbox` instance.
+
+        Raises:
+            SandboxNotFoundError: If `sandbox_id` does not exist.
+            RuntimeError: If the container fails to start or become ready.
+            TypeError: If unsupported keyword arguments are provided.
+        """
+        if kwargs:
+            msg = f"Received unsupported arguments: {list(kwargs.keys())}"
+            raise TypeError(msg)
+
+        from deepagents_code.integrations.docker_sandbox import DockerSandbox
+        from deepagents_code.model_config import resolve_env_var
+
+        effective_working_dir = working_dir or _DOCKER_DEFAULT_WORKING_DIR
+
+        if sandbox_id:
+            state = self._container_state(sandbox_id)
+            if state is None:
+                raise SandboxNotFoundError(sandbox_id)
+            if state == "paused":
+                # `docker start` refuses paused containers.
+                unpause = self._run_cli(
+                    ["unpause", sandbox_id], timeout=_DOCKER_CLI_TIMEOUT
+                )
+                if unpause.returncode != 0:
+                    msg = (
+                        f"Failed to unpause existing container '{sandbox_id}': "
+                        f"{unpause.stderr.strip()}"
+                    )
+                    raise RuntimeError(msg)
+            elif state != "running":
+                start = self._run_cli(
+                    ["start", sandbox_id], timeout=_DOCKER_CLI_TIMEOUT
+                )
+                if start.returncode != 0:
+                    msg = (
+                        f"Failed to start existing container '{sandbox_id}': "
+                        f"{start.stderr.strip()}"
+                    )
+                    raise RuntimeError(msg)
+            # Ensure the working directory exists before commands run with
+            # `docker exec -w`, which fails on a missing directory.
+            mkdir = self._run_cli(
+                ["exec", sandbox_id, "mkdir", "-p", effective_working_dir],
+                timeout=_DOCKER_CLI_TIMEOUT,
+            )
+            if mkdir.returncode != 0:
+                msg = (
+                    f"Failed to prepare working directory "
+                    f"'{effective_working_dir}' in container '{sandbox_id}': "
+                    f"{mkdir.stderr.strip()}"
+                )
+                raise RuntimeError(msg)
+            return DockerSandbox(sandbox_id, working_dir=effective_working_dir)
+
+        effective_image = (
+            image or resolve_env_var("DOCKER_SANDBOX_IMAGE") or _DOCKER_DEFAULT_IMAGE
+        )
+        try:
+            run_result = self._run_cli(
+                [
+                    "run",
+                    "-d",
+                    "--label",
+                    _DOCKER_CONTAINER_LABEL,
+                    "-w",
+                    effective_working_dir,
+                    effective_image,
+                    "/bin/sh",
+                    "-c",
+                    _DOCKER_KEEPALIVE_COMMAND,
+                ],
+                timeout=_DOCKER_CREATE_TIMEOUT,
+            )
+        except RuntimeError as e:
+            # `_run_cli` raises RuntimeError only on CLI timeout here; the
+            # likely cause is a slow first-time image pull.
+            msg = (
+                f"Timed out creating Docker sandbox from image "
+                f"'{effective_image}' (the image pull may be slow; pre-pull it "
+                f"with 'docker pull {effective_image}' and retry)."
+            )
+            raise RuntimeError(msg) from e
+        if run_result.returncode != 0:
+            msg = (
+                f"Failed to create Docker sandbox from image "
+                f"'{effective_image}': {run_result.stderr.strip()}"
+            )
+            raise RuntimeError(msg)
+        container_id = run_result.stdout.strip()
+
+        backend = DockerSandbox(container_id, working_dir=effective_working_dir)
+        for _ in range(max(timeout // 2, 1)):
+            try:
+                result = backend.execute("echo ready", timeout=5)
+                if result.exit_code == 0:
+                    break
+            except Exception:  # noqa: S110, BLE001  # Sandbox not ready yet, continue polling
+                pass
+            # Bail out early if the container already died (e.g. a custom
+            # image whose /bin/sh rejects the keep-alive loop) instead of
+            # burning the whole timeout — mirrors _ModalProvider's poll().
+            try:
+                state = self._container_state(container_id)
+            except RuntimeError:
+                state = "unknown"  # Transient inspect failure; keep polling
+            if state in {None, "exited", "dead"}:
+                with contextlib.suppress(Exception):
+                    self.delete(sandbox_id=container_id)
+                msg = "Docker sandbox terminated unexpectedly during startup"
+                raise RuntimeError(msg)
+            time.sleep(2)
+        else:
+            with contextlib.suppress(Exception):
+                self.delete(sandbox_id=container_id)
+            msg = f"Docker sandbox failed to become ready within {timeout} seconds"
+            raise RuntimeError(msg)
+
+        return backend
+
+    def delete(self, *, sandbox_id: str, **kwargs: Any) -> None:  # noqa: ARG002  # required by SandboxProvider interface
+        """Force-remove a sandbox container (already-removed containers are a no-op).
+
+        Raises:
+            RuntimeError: If removal fails for any reason other than the
+                container not existing.
+        """
+        result = self._run_cli(["rm", "-f", sandbox_id], timeout=_DOCKER_CLI_TIMEOUT)
+        if result.returncode != 0 and "no such container" not in result.stderr.lower():
+            msg = (
+                f"Failed to remove Docker container '{sandbox_id}': "
+                f"{result.stderr.strip()}"
+            )
+            raise RuntimeError(msg)
 
 
 class _DaytonaProvider(SandboxProvider):

@@ -76,6 +76,28 @@ def test_create_sandbox_passes_langsmith_snapshot_name() -> None:
     provider.delete.assert_called_once_with(sandbox_id="sandbox-1")
 
 
+def test_create_sandbox_cleans_up_when_setup_script_fails(tmp_path) -> None:
+    """A failing setup script must not leak the just-created sandbox."""
+    backend = MagicMock(id="sandbox-1")
+    backend.execute.return_value = MagicMock(exit_code=1, output="boom")
+    provider = MagicMock()
+    provider.get_or_create.return_value = backend
+    script = tmp_path / "setup.sh"
+    script.write_text("exit 1\n")
+
+    with (
+        patch(
+            "deepagents_code.integrations.sandbox_factory._get_provider",
+            return_value=provider,
+        ),
+        pytest.raises(RuntimeError, match="Setup failed"),
+        create_sandbox("langsmith", setup_script_path=str(script)),
+    ):
+        pass
+
+    provider.delete.assert_called_once_with(sandbox_id="sandbox-1")
+
+
 def test_create_sandbox_passes_runloop_snapshot_name() -> None:
     """Runloop blueprint names are forwarded to the provider."""
     backend = MagicMock(id="sandbox-1")
